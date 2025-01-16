@@ -14,6 +14,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import OnboardingNavigation from "@/components/onboarding/navigation";
 import {
   Select,
   SelectContent,
@@ -21,13 +22,21 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import OnboardingNavigation from "./navigation";
-import { useOnboardingFlow } from "./context/onboarding-context";
+import AISection from "../settings/ai-section";
 
-const OnboardingAPISetup = () => {
+interface OnboardingAPISetupProps {
+  className?: string;
+  handleNextSlide: () => void;
+  handlePrevSlide: () => void;
+}
+
+const OnboardingAPISetup: React.FC<OnboardingAPISetupProps> = ({
+  className,
+  handleNextSlide,
+  handlePrevSlide,
+}) => {
   const { toast } = useToast();
   const { settings, updateSettings } = useSettings();
-  const { handlePrevSlide } = useOnboardingFlow();
   const [localSettings, setLocalSettings] = React.useState(settings);
   const [showApiKey, setShowApiKey] = React.useState(false);
   const [areAllInputsFilled, setAreAllInputsFilled] = React.useState(false);
@@ -46,12 +55,14 @@ const OnboardingAPISetup = () => {
 
   useEffect(() => {
     const { aiUrl, openaiApiKey, aiModel } = localSettings;
-    const isApiKeyRequired = aiUrl !== "https://ai-proxy.i-f9f.workers.dev/v1" && aiUrl !== "http://localhost:11434/v1";
-    
+    const isApiKeyRequired =
+      aiUrl !== "https://ai-proxy.i-f9f.workers.dev/v1" &&
+      aiUrl !== "http://localhost:11434/v1";
+
     setAreAllInputsFilled(
-      aiUrl.trim() !== "" && 
-      aiModel.trim() !== "" && 
-      (!isApiKeyRequired || openaiApiKey.trim() !== "")
+      aiUrl.trim() !== "" &&
+        aiModel.trim() !== "" &&
+        (!isApiKeyRequired || openaiApiKey.trim() !== "")
     );
   }, [localSettings]);
 
@@ -59,6 +70,11 @@ const OnboardingAPISetup = () => {
     const { aiUrl, openaiApiKey, aiModel } = localSettings;
     const newErrors: { [key: string]: string } = {};
     try {
+      const t = toast({
+        title: "validating AI provider",
+        description: "please wait...",
+        duration: 10000,
+      });
       const response = await fetch(`${aiUrl}/chat/completions`, {
         method: "POST",
         headers: {
@@ -75,7 +91,7 @@ const OnboardingAPISetup = () => {
             {
               role: "user",
               content:
-                "Tell me a short joke (1-2 sentences) about screen recording, answer in lower case only.",
+                "Tell me a very short joke (1-2 sentences) about screen recording, AI, and screenpipe, answer in lower case only.",
             },
           ],
           max_tokens: 60,
@@ -88,7 +104,8 @@ const OnboardingAPISetup = () => {
         const joke = data.choices[0].message.content.trim();
 
         console.log("ai is ready!", joke);
-        toast({
+        t.update({
+          id: t.id,
           title: "ai is ready!",
           description: `here's a joke: ${joke}`,
           duration: 5000,
@@ -126,7 +143,7 @@ const OnboardingAPISetup = () => {
       //   description: "ai setup completed successfully",
       //   variant: "default",
       // });
-      // handleNextSlide();
+      handleNextSlide();
     }
   };
 
@@ -268,7 +285,7 @@ const OnboardingAPISetup = () => {
   };
 
   return (
-    <div className={`flex h-[80%] flex-col`}>
+    <div className={`flex h-[80%] flex-col ${className}`}>
       <DialogHeader className="flex flex-col px-2 justify-center items-center">
         <img
           className="w-24 h-24 justify-center"
@@ -280,11 +297,15 @@ const OnboardingAPISetup = () => {
         </DialogTitle>
       </DialogHeader>
       <Card className="mt-4">
-        <CardHeader>
-          <CardTitle className="text-center">setup api key</CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-col items-center space-y-4">
-          <div className="w-full max-w-md">
+        <CardContent className="flex flex-col items-center space-y-4 max-h-[60vh] overflow-y-auto ">
+          <AISection />
+          <div className="mb-16" />
+          <div className="mb-16" />
+          <div className="mb-16" />
+          <div className="mb-16" />
+          <div className="mb-16" />
+          <div className="mb-16" />
+          {/* <div className="w-full max-w-md">
             <div className="flex items-center gap-2 mb-2">
               <Label htmlFor="aiUrl" className="min-w-[100px] text-right">
                 ai provider
@@ -413,7 +434,7 @@ const OnboardingAPISetup = () => {
                 </Tooltip>
               </TooltipProvider>
             </div>
-          </div>
+          </div> */}
         </CardContent>
       </Card>
       <a
@@ -426,15 +447,20 @@ const OnboardingAPISetup = () => {
         don&apos;t have api key ? set up ollama locally
         <ArrowUpRight className="inline w-4 h-4 ml-1 " />
       </a>
-
       <OnboardingNavigation
-        className="mt-9"
-        nextBtnText="next"
-        prevBtnText="previous"
+        className="mt-8"
+        isLoading={isValidating}
         handlePrevSlide={handlePrevSlide}
-        handleNextSlide={async () => {
-          // await handleNextWithPreference();
-        }}
+        handleNextSlide={
+          areAllInputsFilled
+            ? handleValidationMoveNextSlide
+            : () => {
+                updateSettings(localSettings);
+                handleNextSlide();
+              }
+        }
+        prevBtnText="previous"
+        nextBtnText={areAllInputsFilled ? "setup" : "i'll setup later"}
       />
     </div>
   );

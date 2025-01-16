@@ -5,7 +5,6 @@ use axum::{
     routing::{get, post},
     serve, Router,
 };
-use crossbeam::queue::SegQueue;
 use futures::{
     future::{try_join, try_join_all},
     Stream,
@@ -30,8 +29,8 @@ use screenpipe_audio::{
     default_input_device, default_output_device, list_audio_devices,
     realtime::RealtimeTranscriptionEvent, AudioDevice, DeviceControl, DeviceType,
 };
-use screenpipe_vision::monitor::list_monitors;
 use screenpipe_vision::OcrEngine;
+use screenpipe_vision::{core::RealtimeVisionEvent, monitor::list_monitors};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -46,7 +45,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::broadcast};
 use tower_http::{cors::Any, trace::TraceLayer};
 use tower_http::{cors::CorsLayer, trace::DefaultMakeSpan};
 
@@ -61,7 +60,7 @@ use std::str::FromStr;
 pub struct AppState {
     pub db: Arc<DatabaseManager>,
     pub vision_control: Arc<AtomicBool>,
-    pub audio_devices_control: Arc<SegQueue<(AudioDevice, DeviceControl)>>,
+    pub audio_devices_tx: Arc<broadcast::Sender<(AudioDevice, DeviceControl)>>,
     pub devices_status: HashMap<AudioDevice, DeviceControl>,
     pub app_start_time: DateTime<Utc>,
     pub screenpipe_dir: PathBuf,
@@ -73,6 +72,7 @@ pub struct AppState {
     pub realtime_transcription_enabled: bool,
     pub realtime_transcription_sender:
         Arc<tokio::sync::broadcast::Sender<RealtimeTranscriptionEvent>>,
+    pub realtime_vision_sender: Arc<tokio::sync::broadcast::Sender<RealtimeVisionEvent>>,
 }
 
 // Update the SearchQuery struct
@@ -799,7 +799,7 @@ pub struct Server {
     db: Arc<DatabaseManager>,
     addr: SocketAddr,
     vision_control: Arc<AtomicBool>,
-    audio_devices_control: Arc<SegQueue<(AudioDevice, DeviceControl)>>,
+    audio_devices_tx: Arc<tokio::sync::broadcast::Sender<(AudioDevice, DeviceControl)>>,
     screenpipe_dir: PathBuf,
     pipe_manager: Arc<PipeManager>,
     vision_disabled: bool,
@@ -807,6 +807,7 @@ pub struct Server {
     ui_monitoring_enabled: bool,
     realtime_transcription_enabled: bool,
     realtime_transcription_sender: tokio::sync::broadcast::Sender<RealtimeTranscriptionEvent>,
+    realtime_vision_sender: Arc<tokio::sync::broadcast::Sender<RealtimeVisionEvent>>,
 }
 
 impl Server {
@@ -815,7 +816,7 @@ impl Server {
         db: Arc<DatabaseManager>,
         addr: SocketAddr,
         vision_control: Arc<AtomicBool>,
-        audio_devices_control: Arc<SegQueue<(AudioDevice, DeviceControl)>>,
+        audio_devices_tx: Arc<tokio::sync::broadcast::Sender<(AudioDevice, DeviceControl)>>,
         screenpipe_dir: PathBuf,
         pipe_manager: Arc<PipeManager>,
         vision_disabled: bool,
@@ -823,12 +824,13 @@ impl Server {
         ui_monitoring_enabled: bool,
         realtime_transcription_enabled: bool,
         realtime_transcription_sender: tokio::sync::broadcast::Sender<RealtimeTranscriptionEvent>,
+        realtime_vision_sender: Arc<tokio::sync::broadcast::Sender<RealtimeVisionEvent>>,
     ) -> Self {
         Server {
             db,
             addr,
             vision_control,
-            audio_devices_control,
+            audio_devices_tx,
             screenpipe_dir,
             pipe_manager,
             vision_disabled,
@@ -836,6 +838,7 @@ impl Server {
             ui_monitoring_enabled,
             realtime_transcription_enabled,
             realtime_transcription_sender,
+            realtime_vision_sender,
         }
     }
 
@@ -851,7 +854,7 @@ impl Server {
         let app_state = Arc::new(AppState {
             db: self.db.clone(),
             vision_control: self.vision_control,
-            audio_devices_control: self.audio_devices_control,
+            audio_devices_tx: self.audio_devices_tx,
             devices_status: device_status,
             app_start_time: Utc::now(),
             screenpipe_dir: self.screenpipe_dir.clone(),
@@ -870,6 +873,7 @@ impl Server {
             },
             realtime_transcription_enabled: self.realtime_transcription_enabled,
             realtime_transcription_sender: Arc::new(self.realtime_transcription_sender),
+            realtime_vision_sender: self.realtime_vision_sender,
         });
 
         let app = create_router()
@@ -1606,6 +1610,147 @@ async fn sse_transcription_handler(
     ))
 }
 
+
+#[derive(Deserialize)]
+pub struct AudioDeviceControlRequest {
+    device_name: String,
+    #[serde(default)]
+    device_type: Option<DeviceType>,
+}
+
+#[derive(Serialize)]
+pub struct AudioDeviceControlResponse {
+    success: bool,
+    message: String,
+}
+
+// Add these new handler functions before create_router()
+async fn start_audio_device(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AudioDeviceControlRequest>,
+) -> Result<JsonResponse<AudioDeviceControlResponse>, (StatusCode, JsonResponse<Value>)> {
+    let device = AudioDevice {
+        name: payload.device_name.clone(),
+        device_type: payload.device_type.unwrap_or(DeviceType::Input),
+    };
+
+    // Validate device exists
+    let available_devices = list_audio_devices().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, 
+         JsonResponse(json!({
+             "error": format!("failed to list audio devices: {}", e),
+             "success": false
+         })))
+    })?;
+
+    if !available_devices.contains(&device) {
+        return Err((StatusCode::BAD_REQUEST, 
+            JsonResponse(json!({
+                "error": format!("device not found: {}", device.name),
+                "success": false
+            }))));
+    }
+
+    let control = DeviceControl { 
+        is_running: true, 
+        is_paused: false 
+    };
+    
+    let _ = state.audio_devices_tx.send((device.clone(), control));
+
+    Ok(JsonResponse(AudioDeviceControlResponse {
+        success: true,
+        message: format!("started audio device: {}", device.name),
+    }))
+}
+
+async fn stop_audio_device(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AudioDeviceControlRequest>,
+) -> Result<JsonResponse<AudioDeviceControlResponse>, (StatusCode, JsonResponse<Value>)> {
+    let device = AudioDevice {
+        name: payload.device_name.clone(),
+        device_type: payload.device_type.unwrap_or(DeviceType::Input),
+    };
+
+    // Validate device exists
+    let available_devices = list_audio_devices().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, 
+         JsonResponse(json!({
+             "error": format!("failed to list audio devices: {}", e),
+             "success": false
+         })))
+    })?;
+
+    if !available_devices.contains(&device) {
+        return Err((StatusCode::BAD_REQUEST, 
+            JsonResponse(json!({
+                "error": format!("device not found: {}", device.name),
+                "success": false
+            }))));
+    }
+    
+    let _ = state.audio_devices_tx.send((device.clone(), DeviceControl {
+        is_running: false,
+        is_paused: false,
+    }));
+
+    Ok(JsonResponse(AudioDeviceControlResponse {
+        success: true,
+        message: format!("stopped audio device: {}", device.name),
+    }))
+}
+
+
+#[derive(Deserialize)]
+struct VisionSSEQuery {
+    images: Option<bool>,
+}
+
+async fn sse_vision_handler(
+    Query(query): Query<VisionSSEQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, Infallible>>>,
+    (StatusCode, JsonResponse<serde_json::Value>),
+> {
+    if state.vision_disabled {
+        return Err((
+            StatusCode::FORBIDDEN,
+            JsonResponse(json!({"error": "Vision streaming is disabled"})),
+        ));
+    }
+    // Get a new subscription - this won't affect the sender
+    let rx = state.realtime_vision_sender.subscribe();
+
+    let include_images = query.images.unwrap_or(false);
+
+    let stream = async_stream::stream! {
+        let mut rx = rx; // Create a new mutable reference to the receiver
+        while let Ok(event) = rx.recv().await {
+            match event {
+                RealtimeVisionEvent::Ocr(mut frame) => {
+                    if !include_images {
+                        frame.image = None; // Remove the image data if not enabled
+                    }
+                    yield Ok(Event::default().data(serde_json::to_string(&frame).unwrap_or_default()));
+                }
+                _ => {
+                    yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
+                }
+            }
+        }
+        // Even if this stream ends, the sender remains active
+    };
+
+    Ok(Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(1))
+            .text("keep-alive-text"),
+    ))
+
+}
+
 pub fn create_router() -> Router<Arc<AppState>> {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -1648,6 +1793,9 @@ pub fn create_router() -> Router<Arc<AppState>> {
         .route("/experimental/frames/merge", post(merge_frames_handler))
         .route("/experimental/validate/media", get(validate_media_handler))
         .route("/sse/transcriptions", get(sse_transcription_handler))
+        .route("/audio/start", post(start_audio_device))
+        .route("/audio/stop", post(stop_audio_device))
+        .route("/sse/vision", get(sse_vision_handler))
         .layer(cors);
 
     #[cfg(feature = "experimental")]
@@ -1862,6 +2010,13 @@ curl 'http://localhost:3030/search?offset=0&limit=10&start_time=2024-08-12T04%3A
 
 
 
+
+
+
+
+
+
+
 # First, search for Rust-related content
 curl "http://localhost:3030/search?q=debug&limit=5&offset=0&content_type=ocr"
 
@@ -1869,6 +2024,8 @@ curl "http://localhost:3030/search?q=debug&limit=5&offset=0&content_type=ocr"
 curl -X POST "http://localhost:3030/tags/vision/626" \
      -H "Content-Type: application/json" \
      -d '{"tags": ["debug"]}'
+
+
 
 
 # List all pipes
@@ -1898,6 +2055,7 @@ curl -X POST "http://localhost:3030/pipes/enable" \
      -d '{"pipe_id": "pipe-stream-ocr-text"}' | jq
 
 
+
      curl -X POST "http://localhost:3030/pipes/enable" \
      -H "Content-Type: application/json" \
      -d '{"pipe_id": "pipe-security-check"}' | jq
@@ -1917,6 +2075,8 @@ curl -X POST "http://localhost:3030/pipes/update" \
          "another_key": "another_value"
        }
      }' | jq
+
+
 
 
 
